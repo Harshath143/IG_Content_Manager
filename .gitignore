@@ -1,0 +1,59 @@
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Env
+venv/
+.venv/
+env/
+ENV/
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
+
+# Environment Variables
+**/.env
+**/.env.local
+**/.env.*
+
+# Project Specific Media & Downloads
+**/downloads/
+**/output/
+**/*.mp4
+**/*.mp3
+**/*.m4a
+
+# Project Specific Data (Ignore user links data, keep categories taxonomy template if desired)
+**/data/links.xlsx
+**/data/links.csv
+**/data/links_1.xlsx
+
+# IDE Settings
+.idea/
+.vscode/
+**/.idea/
+**/.vscode/
+
+# OS Files
+.DS_Store
+Thumbs.db
+**/Thumbs.db
