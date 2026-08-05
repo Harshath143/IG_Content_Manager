@@ -2,15 +2,204 @@
 import yt_dlp
 import os
 import re
+import sys
 import urllib.request
+import instaloader
+import asyncio
+import ssl
+import subprocess
+import imageio_ffmpeg
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+
+def get_cookies_opts():
+    """Detects available cookie sources for yt-dlp."""
+    cookie_file = os.getenv("COOKIES_FILE", "cookies.txt")
+    if os.path.exists(cookie_file):
+        return {'cookiefile': cookie_file}
+    if os.path.exists("data/cookies.txt"):
+        return {'cookiefile': "data/cookies.txt"}
+    
+    browser = os.getenv("COOKIES_FROM_BROWSER")
+    if browser:
+        return {'cookiesfrombrowser': (browser,)}
+    
+    return {}
+
+def extract_via_playwright(url, shortcode):
+    """Fallback extraction using Playwright browser to capture captions, video & audio, merging with FFmpeg."""
+    print("   🌐 Attempting Playwright Browser fallback (Audio + Video)...")
+    caption = ""
+    downloaded_path = None
+    image_paths = []
+
+    ctx_ssl = ssl.create_default_context()
+    ctx_ssl.check_hostname = False
+    ctx_ssl.verify_mode = ssl.CERT_NONE
+
+    def inspect_streams(file_path):
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            cmd = [ffmpeg_exe, "-i", file_path]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            err = res.stderr.decode('utf-8', errors='ignore')
+            return ("Video:" in err), ("Audio:" in err)
+        except Exception:
+            return False, False
+
+    async def _pw_run():
+        nonlocal caption, downloaded_path, image_paths
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800}
+                )
+                page = await context.new_page()
+                captured_cdn_urls = set()
+
+                async def handle_request(req):
+                    try:
+                        r_url = req.url
+                        if ("fbcdn.net" in r_url or "cdninstagram.com" in r_url) and ("/o1/v/" in r_url or "/t50." in r_url or "mime=" in r_url):
+                            clean_cdn = re.sub(r'&bytestart=\d+&byteend=\d+', '', r_url)
+                            clean_cdn = re.sub(r'\?bytestart=\d+&byteend=\d+&', '?', clean_cdn)
+                            captured_cdn_urls.add(clean_cdn)
+                    except Exception:
+                        pass
+
+                page.on("request", handle_request)
+
+                clean_url = url.split("?")[0].rstrip("/")
+                await page.goto(clean_url, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(6000)
+
+                # Caption Extraction
+                meta_elem = await page.query_selector("meta[property='og:description']")
+                if meta_elem:
+                    caption = await meta_elem.get_attribute("content") or ""
+                if not caption:
+                    meta_elem = await page.query_selector("meta[name='description']")
+                    if meta_elem:
+                        caption = await meta_elem.get_attribute("content") or ""
+
+                if caption:
+                    caption = re.sub(r'^[\d,]+\s+likes,\s+[\d,]+\s+comments\s+-\s+[^\s]+\s+on\s+[^:]+:\s*', '', caption, flags=re.IGNORECASE).strip('"\' ')
+
+                # Process CDN URLs for Video & Audio
+                v_temp = f"downloads/temp_v_{shortcode}.mp4"
+                a_temp = f"downloads/temp_a_{shortcode}.m4a"
+                v_saved = False
+                a_saved = False
+
+                for idx, cdn_url in enumerate(list(captured_cdn_urls)):
+                    temp_chk = f"downloads/chk_{idx}_{shortcode}.mp4"
+                    try:
+                        req = urllib.request.Request(cdn_url, headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            'Referer': 'https://www.instagram.com/'
+                        })
+                        with urllib.request.urlopen(req, context=ctx_ssl) as resp:
+                            data = resp.read()
+                            if len(data) > 10000:
+                                with open(temp_chk, "wb") as f:
+                                    f.write(data)
+                                has_v, has_a = inspect_streams(temp_chk)
+
+                                if has_v and has_a and not v_saved:
+                                    # Combined stream found
+                                    final_out = f"downloads/{shortcode}.mp4"
+                                    os.replace(temp_chk, final_out)
+                                    downloaded_path = final_out
+                                    v_saved = True
+                                    a_saved = True
+                                    print(f"   ✅ Captured combined Video+Audio stream: {final_out}")
+                                    break
+                                elif has_v and not v_saved:
+                                    os.replace(temp_chk, v_temp)
+                                    v_saved = True
+                                elif has_a and not a_saved:
+                                    os.replace(temp_chk, a_temp)
+                                    a_saved = True
+
+                                if v_saved and a_saved:
+                                    break
+                    except Exception:
+                        pass
+                    finally:
+                        if os.path.exists(temp_chk):
+                            try: os.remove(temp_chk)
+                            except Exception: pass
+
+                # Merge separate Video & Audio streams if needed
+                final_target = f"downloads/{shortcode}.mp4"
+                if v_saved and a_saved and not downloaded_path:
+                    try:
+                        import imageio_ffmpeg
+                        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                        cmd = [ffmpeg_exe, "-y", "-i", v_temp, "-i", a_temp, "-c", "copy", final_target]
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        if res.returncode == 0 and os.path.exists(final_target):
+                            downloaded_path = final_target
+                            print(f"   🚀 Merged Video + Audio streams successfully: {final_target} ({os.path.getsize(final_target)} bytes)")
+                    except Exception as me:
+                        print(f"   ⚠️ FFmpeg merge warning: {me}")
+                elif v_saved and not downloaded_path:
+                    os.replace(v_temp, final_target)
+                    downloaded_path = final_target
+                    print(f"   ✅ Saved Video stream: {final_target}")
+
+                # Clean temporary stream files
+                for tf in [v_temp, a_temp]:
+                    if os.path.exists(tf):
+                        try: os.remove(tf)
+                        except Exception: pass
+
+                # Image Download
+                post_folder = f"downloads/{shortcode}"
+                os.makedirs(post_folder, exist_ok=True)
+                og_img = await page.query_selector("meta[property='og:image']")
+                if og_img:
+                    img_url = await og_img.get_attribute("content")
+                    if img_url:
+                        i_path = f"{post_folder}/img_01.jpg"
+                        try:
+                            req = urllib.request.Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, context=ctx_ssl) as response, open(i_path, 'wb') as f:
+                                f.write(response.read())
+                            if os.path.exists(i_path) and os.path.getsize(i_path) > 2000:
+                                image_paths.append(i_path)
+                                print(f"   ✅ Downloaded image: {i_path}")
+                        except Exception:
+                            pass
+
+                await page.close()
+                await browser.close()
+        except Exception as e:
+            print(f"   ⚠️ Playwright browser error: {e}")
+
+    try:
+        asyncio.run(_pw_run())
+    except Exception as e:
+        print(f"   ⚠️ Playwright async error: {e}")
+
+    return caption, downloaded_path, image_paths
+
+
 
 def get_video_intel(url, rotator):
     # Clean URL to extract shortcode correctly
     clean_url = url.split("?")[0].rstrip("/")
     shortcode = clean_url.split("/")[-1]
-    path = f"downloads/{shortcode}.mp4"
     
-    # Download Strategy: Try Video -> Convert Fallback -> Metadata Only
     print(f"   ⬇️ Processing: {clean_url}")
     
     caption = ""
@@ -18,155 +207,145 @@ def get_video_intel(url, rotator):
     image_paths = []
     is_video = False
     
-    # 1. Determine Content Type (Video vs Image)
+    cookie_opts = get_cookies_opts()
+
+    # 1. Primary Strategy: yt-dlp
     try:
-        ydl_opts_meta = {'quiet': True, 'no_warnings': True}
+        ydl_opts_meta = {
+            'quiet': True,
+            'no_warnings': True,
+            'logger': None,
+            **cookie_opts
+        }
         with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-            # We catch errors here to detect 'no video' scenarios early
             try:
                 info = ydl.extract_info(url, download=False)
-                caption = info.get('description', '')
-                if info.get('_type') == 'video' or 'formats' in info:
-                     is_video = True
+                caption = info.get('description') or info.get('title') or ""
+                if info.get('_type') == 'video' or 'formats' in info or info.get('vcodec') != 'none':
+                    is_video = True
                 else:
-                     is_video = False
+                    is_video = False
             except Exception as e:
-                # If extract_info crashes, check if it's the "no video" error
-                if "no video in this post" in str(e).lower():
-                    print("   ℹ️ 'No video' detected. Treating as valid static post.")
+                err_str = str(e).lower()
+                if "no video in this post" in err_str:
                     is_video = False
                 else:
-                    raise e # Re-raise if it's something else
-                 
-    except Exception as e:
-        print(f"   ⚠️ metadata/download error: {e}")
-        return "[Error extracting content]", "", []
+                    raise e
+                    
+    except Exception:
+        pass
 
-    # 2. Download Content
-    try:
-        if is_video:
-             # Video Download
-             path = f"downloads/{shortcode}.mp4"
-             ydl_opts_download = {'outtmpl': path, 'quiet': True, 'no_warnings': True}
-             print(f"   ⬇️ Downloading Video to {path}...")
-             with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
-                 ydl.download([url])
-             downloaded_path = path 
-        else:
-            # Static/Image Download
-            print("   📸 Static Post detected. Downloading images...")
-            
-            # Create a subfolder for this post
+    # 2. Download Content via yt-dlp
+    if caption or is_video:
+        try:
             post_folder = f"downloads/{shortcode}"
             os.makedirs(post_folder, exist_ok=True)
-            
-            # Template for images: downloads/shortcode/img_01.jpg
-            image_template = f"{post_folder}/img_%(autonumber)02d"
-            
-            # ATTEMPT 1: Try to download as a regular "video" (which works for carousels/images often)
-            ydl_opts_img = {
-                'outtmpl': f"{image_template}", 
-                'quiet': True, 
-                'no_warnings': True,
-                'ignoreerrors': True,
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts_img) as ydl:
-                    ydl.download([url])
-            except:
-                pass
-            
-            # Find downloaded images in the subfolder
-            for file in os.listdir(post_folder):
-                if file.startswith("img_") and file.endswith(('.jpg', '.png', '.webp')):
-                        image_paths.append(os.path.join(post_folder, file))
 
-            # ATTEMPT 2: Fallback to Thumbnail extraction if main download failed (Common for single images)
-            if not image_paths:
-                print("   ⚠️ Main download failed. Trying thumbnail extraction...")
-                ydl_opts_thumb = {
-                    'outtmpl': f"{post_folder}/img_01", # Force single filename for thumb
-                    'quiet': True, 
+            if is_video:
+                path = f"downloads/{shortcode}.mp4"
+                ydl_opts_download = {
+                    'outtmpl': path,
+                    'quiet': True,
                     'no_warnings': True,
+                    'logger': None,
+                    **cookie_opts
+                }
+                print(f"   ⬇️ Downloading Video to {path}...")
+                with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
+                    ydl.download([url])
+                if os.path.exists(path):
+                    downloaded_path = path
+            else:
+                print("   📸 Static Post detected. Downloading images...")
+                image_template = f"{post_folder}/img_%(autonumber)02d"
+                ydl_opts_img = {
+                    'outtmpl': f"{image_template}",
+                    'quiet': True,
+                    'no_warnings': True,
+                    'ignoreerrors': True,
                     'writethumbnail': True,
-                    'skip_download': True,
-                    'ignoreerrors': True
+                    'logger': None,
+                    **cookie_opts
                 }
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts_thumb) as ydl:
+                    with yt_dlp.YoutubeDL(ydl_opts_img) as ydl:
                         ydl.download([url])
-                except:
+                except Exception:
                     pass
-                
-                # Check again
+
+
                 for file in os.listdir(post_folder):
-                    if (file.startswith("img_") or "webp" in file or "jpg" in file) and file.endswith(('.jpg', '.png', '.webp')):
-                         full_path = os.path.join(post_folder, file)
-                         if full_path not in image_paths:
-                             image_paths.append(full_path)
-            
-            # ATTEMPT 3: Manual Redirect Check (Last Resort for "No Video" errors)
-            if not image_paths:
-                print("   ⚠️ Thumbnail extraction failed. Attempting /media/?size=l fallback...")
+                    if file.startswith("img_") and file.endswith(('.jpg', '.png', '.webp')):
+                        image_paths.append(os.path.join(post_folder, file))
+        except Exception as e:
+            print(f"   ⚠️ Download error: {e}")
+
+    # 3. Fallback Strategy: Instaloader if yt-dlp didn't get media/caption
+    if not caption and not downloaded_path and not image_paths:
+        try:
+            post_folder = f"downloads/{shortcode}"
+            os.makedirs(post_folder, exist_ok=True)
+
+            L = instaloader.Instaloader(
+                download_pictures=True,
+                download_videos=True,
+                download_video_thumbnails=False,
+                download_geotags=False,
+                download_comments=False,
+                save_metadata=False
+            )
+            L.context.max_attempts = 1
+
+            cookie_file = cookie_opts.get('cookiefile')
+            if cookie_file and os.path.exists(cookie_file):
                 try:
-                    # Construct media URL
-                    media_url = f"{url.rstrip('/')}/media/?size=l"
-                    
-                    # Basic request with User-Agent
-                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                    req = urllib.request.Request(media_url, headers=headers)
-                    
-                    with urllib.request.urlopen(req) as response:
-                        final_url = response.geturl()
-                        if ".jpg" in final_url or ".webp" in final_url:
-                             fallback_path = f"{post_folder}/img_fallback.jpg"
-                             with open(fallback_path, 'wb') as f:
-                                 f.write(response.read())
-                             
-                             image_paths.append(fallback_path)
-                             print(f"   ✅ Fetched fallback image via redirect: {fallback_path}")
-                        else:
-                             print(f"   ❌ Fallback redirect failed (non-image): {final_url}")
+                    import http.cookiejar
+                    cj = http.cookiejar.MozillaCookieJar(cookie_file)
+                    cj.load(ignore_discard=True, ignore_expires=True)
+                    L.context._session.cookies = cj
+                except Exception:
+                    pass
 
-                except Exception as e:
-                    print(f"   ❌ Fallback failed: {e}")
+            post = instaloader.Post.from_shortcode(L.context, shortcode)
+            caption = post.caption or ""
 
-            if not image_paths:
-                print("   ⚠️ No images found after all attempts.")
+            if post.is_video:
+                v_path = f"downloads/{shortcode}.mp4"
+                L.download_post(post, target=post_folder)
+                for f in os.listdir(post_folder):
+                    if f.endswith('.mp4'):
+                        full_f = os.path.join(post_folder, f)
+                        os.replace(full_f, v_path)
+                        downloaded_path = v_path
+                        break
             else:
-                print(f"   ✅ Found {len(image_paths)} images in {post_folder}")
-            
-            # 3. Try Downloading Audio (if present in static post)
-            print("   🎵 Checking for audio in static post...")
-            # We save audio as 'shortcode.m4a' inside the same folder
-            audio_path_template = f"{post_folder}/{shortcode}" 
-            ydl_opts_audio = {
-                'outtmpl': audio_path_template,
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'm4a',
-                }],
-                'quiet': True,
-                'no_warnings': True,
-                'ignoreerrors': True,
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
-                    ydl.download([url])
-                
-                potential_audio = f"{post_folder}/{shortcode}.m4a"
-                if os.path.exists(potential_audio):
-                        downloaded_path = potential_audio # Use this for transcription!
-                        print(f"   ✅ Audio downloaded: {potential_audio}")
-            except Exception as e:
-                pass
+                L.download_post(post, target=post_folder)
+                for f in os.listdir(post_folder):
+                    if f.endswith(('.jpg', '.png', '.webp')):
+                        image_paths.append(os.path.join(post_folder, f))
 
-    except Exception as e:
-        print(f"   ⚠️ Download error: {e}")
-        return "[Error downloading]", "", []
+        except Exception:
+            pass
 
-    # 2. Transcribe (Only if we have a file)
+
+    # 4. Fallback Strategy: Playwright Browser if previous tiers failed
+    if not caption and not downloaded_path and not image_paths:
+        caption, downloaded_path, image_paths = extract_via_playwright(url, shortcode)
+
+    # Clean up empty post folder if created but no media files saved inside
+    post_folder = f"downloads/{shortcode}"
+    if os.path.exists(post_folder) and not os.listdir(post_folder):
+        try:
+            os.rmdir(post_folder)
+        except Exception:
+            pass
+
+    # Validation: If after all attempts we have no caption, no video, and no images, return failure indicator
+    if not caption and not downloaded_path and not image_paths:
+        print(f"   ❌ Extraction failed completely for {clean_url}")
+        return None, "", []
+
+    # 5. Transcribe (Only if we have a valid video/audio file)
     transcript = ""
     if downloaded_path and os.path.exists(downloaded_path):
         print("   🎙️ Transcribing audio...")
@@ -174,15 +353,15 @@ def get_video_intel(url, rotator):
         try:
             with open(downloaded_path, "rb") as f:
                 transcript = client.audio.transcriptions.create(
-                    file=(downloaded_path, f.read()), 
+                    file=(downloaded_path, f.read()),
                     model="whisper-large-v3-turbo"
                 ).text
             print("   ✅ Transcription complete.")
         except Exception as e:
-            # Catch "no audio track" (400) or other API errors
             print(f"   ⚠️ Transcription skipped/failed (likely silent or static): {e}")
             transcript = ""
     else:
-        print("   ⏭️ Skipping transcription (No video file).")
+        print("   ⏭️ Skipping transcription (No video file downloaded).")
 
     return caption, transcript, image_paths
+

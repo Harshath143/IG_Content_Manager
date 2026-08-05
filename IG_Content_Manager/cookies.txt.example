@@ -1,0 +1,15 @@
+# Netscape HTTP Cookie File
+# http://curl.haxx.se/rfc/cookie_spec.html
+# This is a sample cookies file for Instagram authentication.
+# 
+# HOW TO GET YOUR COOKIES:
+# 1. Install Chrome/Edge/Firefox extension: "Get cookies.txt LOCALLY" or "cookies.txt".
+# 2. Log in to instagram.com in your web browser.
+# 3. Open the extension while on instagram.com and click "Export" / "Save to file".
+# 4. Save the exported file as 'cookies.txt' in this project folder:
+#    C:\projects\IG_ContentManager\IG_Content_Manager\cookies.txt
+#
+# EXAMPLE COOKIE ENTRIES:
+.instagram.com	TRUE	/	TRUE	1799999999	sessionid	YOUR_SESSION_ID_HERE
+.instagram.com	TRUE	/	TRUE	1799999999	ds_user_id	YOUR_USER_ID_HERE
+.instagram.com	TRUE	/	TRUE	1799999999	csrftoken	YOUR_CSRF_TOKEN_HERE

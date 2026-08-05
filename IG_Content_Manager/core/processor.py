@@ -29,31 +29,13 @@ def generate_metadata(caption, transcript, categories, rotator, image_paths=[]):
     CATEGORIES: [text]
     """
 
-    messages = []
-    model = "llama-3.1-8b-instant"
+    messages = [{"role": "user", "content": text_prompt}]
+    model = "llama-3.3-70b-versatile"
 
-    if image_paths:
-        # Switch to Vision Model
-        model = "meta-llama/llama-4-scout-17b-16e-instruct"
-        content = [{"type": "text", "text": text_prompt}]
-        
-        # Add up to 3 images to avoid token limits
-        for img_path in image_paths[:3]: 
-            base64_image = encode_image(img_path)
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}"
-                }
-            })
-        messages = [{"role": "user", "content": content}]
-    else:
-        # Standard Text Model
-        messages = [{"role": "user", "content": text_prompt}]
-    
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=0.2 
     )
+
     return response.choices[0].message.content

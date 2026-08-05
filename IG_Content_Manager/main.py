@@ -1,19 +1,26 @@
 import os
+import sys
 import pandas as pd
 import yt_dlp
+import time
+import re
 from core.rotator import APIKeyRotator
 from tqdm import tqdm
 
 from core.extractor import get_video_intel
 from core.processor import generate_metadata
 
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # --- CONFIGURATION ---
 KEYS = ["GROQ_KEY_1", "GROQ_KEY_2", "GROQ_KEY_3", "GROQ_KEY_4", "GROQ_KEY_5"]
 rotator = APIKeyRotator(KEYS)
 DOWNLOAD_PATH = "downloads"
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-
-import re
 
 def parse_ai_output(url, raw_output):
     """Parses the raw AI text response into a structured dict using regex."""
@@ -128,16 +135,19 @@ def main():
     if os.path.exists(output_file):
         try:
             existing_df = pd.read_excel(output_file)
-            processed_urls = set(existing_df['Link'].astype(str).str.strip())
-            final_results = existing_df.to_dict('records')
-            print(f"🔄 Resuming... Found {len(final_results)} items already processed.")
+            if not existing_df.empty:
+                processed_urls = set(existing_df['Link'].astype(str).str.strip())
+                final_results = existing_df.to_dict('records')
+                print(f"🔄 Resuming... Found {len(final_results)} items already processed.")
         except Exception as e:
             print(f"⚠️ Could not load existing report: {e}")
+
+    failed_count = 0
 
     for url in tqdm(links_df['link'], desc="🚀 Processing Instagram Data"):
         url_str = str(url).strip()
         
-        # Skip if already processed
+        # Skip if already processed successfully
         if url_str in processed_urls:
             continue
 
@@ -145,6 +155,12 @@ def main():
             # 1. Extract (Download & Transcribe & Images)
             caption, transcript, image_paths = get_video_intel(url_str, rotator)
             
+            # If extraction failed completely, do NOT generate fake AI metadata or save dummy results
+            if caption is None and not transcript and not image_paths:
+                failed_count += 1
+                print(f"   ⚠️ Skipping AI processing for {url_str} due to extraction failure.")
+                continue
+
             # 2. Process (AI Synthesis)
             raw_ai_output = generate_metadata(caption, transcript, cat_list, rotator, image_paths)
             
@@ -152,8 +168,7 @@ def main():
             row = parse_ai_output(url_str, raw_ai_output)
             final_results.append(row)
             
-            # INCREMENTAL SAVE (Safety) - Critical Step
-            import time
+            # INCREMENTAL SAVE (Safety)
             while True:
                 try:
                     pd.DataFrame(final_results).to_excel(output_file, index=False)
@@ -168,9 +183,17 @@ def main():
                     break
 
         except Exception as e:
-            print(f"Error processing {url}: {e}")
+            print(f"❌ Error processing {url}: {e}")
 
-    print("\n✅ All Content Processed and Exported.")
+    if failed_count > 0:
+        print(f"\n⚠️ {failed_count} item(s) could not be downloaded/extracted.")
+        print("💡 Instagram requires authentication cookies for post/reel access.")
+        print("   To fix this:")
+        print("   1. Export your Instagram browser cookies using an extension like 'Get cookies.txt LOCALLY'.")
+        print("   2. Save the exported file as 'cookies.txt' in this project directory.")
+        print("   3. Re-run `python main.py`.")
+    else:
+        print("\n✅ All Content Processed and Exported.")
 
 if __name__ == "__main__":
-    main()
+    main()
