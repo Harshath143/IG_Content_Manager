@@ -1,6 +1,6 @@
-from groq import Groq
-
+import os
 import base64
+from groq import Groq
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
@@ -30,7 +30,7 @@ def generate_metadata(caption, transcript, categories, rotator, image_paths=[]):
     """
 
     messages = [{"role": "user", "content": text_prompt}]
-    model = "llama-3.3-70b-versatile"
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     response = client.chat.completions.create(
         model=model,

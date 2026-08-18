@@ -96,7 +96,7 @@ def parse_ai_output(url, raw_output):
             
             # Clean description lines individually
             clean_lines = [clean_val(line) for line in desc_content.splitlines() if line.strip()]
-            result["Description"] = "\n".join(clean_lines[:4])
+            result["Description"] = "\n".join(clean_lines)
 
         if not result["Title"] and not result["Description"]:
              print(f"⚠️ Regex parsing failed. Raw output start: {clean_text[:50]}...")
